@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax_memory_monitor"
+version = "0.1.0"
+description = "A lightweight JAX peak memory monitor using pprof"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "jax",
+    "jaxlib",
+    "protobuf"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jax_memory_monitor*"]

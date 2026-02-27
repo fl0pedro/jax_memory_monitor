@@ -1,0 +1,45 @@
+name: Update Profile Proto
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Weekly on Sunday
+  workflow_dispatch:
+
+jobs:
+  update-proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download latest profile.proto
+        run: |
+          curl -sSL https://raw.githubusercontent.com/google/pprof/main/proto/profile.proto -o jax_memory_monitor/profile.proto
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --exit-code jax_memory_monitor/profile.proto; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install protoc
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Regenerate profile_pb2.py
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          protoc --python_out=. jax_memory_monitor/profile.proto
+
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add jax_memory_monitor/profile.proto jax_memory_monitor/profile_pb2.py
+          git commit -m "Update profile.proto and regenerate profile_pb2.py"
+          git push

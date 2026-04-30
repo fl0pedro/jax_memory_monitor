@@ -1,17 +1,18 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "nanobind"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax_memory_monitor"
 version = "0.1.0"
-description = "A lightweight JAX peak memory monitor using pprof"
+description = "A lightweight JAX peak memory monitor"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "jax",
     "jaxlib",
-    "protobuf"
+    "protobuf",
+    "nanobind"
 ]
 
 [tool.setuptools.packages.find]

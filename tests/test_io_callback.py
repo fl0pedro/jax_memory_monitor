@@ -22,6 +22,7 @@ from jax_memory_monitor import ResourceMonitor
 
 _GPUS = [d for d in jax.devices() if d.platform == "gpu"]
 _HAS_TWO_GPUS = len(_GPUS) >= 2
+_HAS_GPU_AND_CPU = bool(_GPUS) and any(d.platform == "cpu" for d in jax.devices("cpu"))
 
 
 def test_io_callback_single_monitor():
@@ -109,3 +110,32 @@ def test_io_callback_multiple_monitors_different_gpu():
     peaks = f(jax.device_put(jnp.zeros(()), src))
     assert int(peaks[0]) >= A[0] * A[1] * 4
     assert int(peaks[1]) >= B[0] * B[1] * 4
+
+
+@pytest.mark.skipif(not _HAS_GPU_AND_CPU, reason="needs GPU and CPU devices")
+def test_io_callback_cpu_target_under_gpu_default():
+    """Caller runs on the default (GPU) backend; callback targets CPU.
+
+    Regression: `jax.live_arrays()` only enumerates the default backend, so
+    CPU live arrays were previously invisible to the monitor when GPUs were
+    present, causing peak=0. The fix queries each tracked platform.
+    """
+    cpu = jax.devices("cpu")[0]
+    SIZE = (2000, 2000)
+
+    @jax.jit
+    def workload(x):
+        return x + jnp.ones_like(x)
+
+    def cb():
+        with ResourceMonitor(device=cpu) as m:
+            x = jax.device_put(jnp.ones(SIZE, dtype=jnp.float32), cpu).block_until_ready()
+            workload(x).block_until_ready()
+        return jnp.asarray(m.peak, dtype=jnp.int32)
+
+    @jax.jit
+    def f():
+        return io_callback(cb, jax.ShapeDtypeStruct((), jnp.int32))
+
+    peak = int(f())
+    assert peak >= 2 * SIZE[0] * SIZE[1] * 4

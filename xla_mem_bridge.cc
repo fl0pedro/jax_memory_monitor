@@ -2,6 +2,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -28,12 +29,19 @@ class MemoryTracker {
 public:
   MemoryTracker(std::vector<nb::object> devices, double poll_interval_sec)
       : poll_interval_ns_(static_cast<int64_t>(poll_interval_sec * 1e9)),
-      running_(false), peak_bytes_(0), sampled_baseline_(0) {
+      running_(false), peak_logical_bytes_(0), sampled_baseline_(0) {
     nb::gil_scoped_acquire gil;
     for (auto &device : devices) {
       bool is_cpu = nb::cast<std::string>(device.attr("platform")) == "cpu";
       bool has_clear = nb::hasattr(device, "clear_memory_stats");
       bool should_sample = is_cpu || !has_clear;
+      if (should_sample) {
+        std::string p = nb::cast<std::string>(device.attr("platform"));
+        if (std::find(sampled_platforms_.begin(), sampled_platforms_.end(), p)
+            == sampled_platforms_.end()) {
+          sampled_platforms_.push_back(std::move(p));
+        }
+      }
       devices_info_.push_back({std::move(device), should_sample, 0});
     }
   }
@@ -45,11 +53,10 @@ public:
       throw std::runtime_error("Tracker is already running");
     }
 
-    peak_bytes_.store(0);
+    peak_logical_bytes_.store(0);
     samples_.clear();
     start_time_ = std::chrono::steady_clock::now();
 
-    bool needs_polling = false;
     {
       nb::gil_scoped_acquire gil;
       for (auto &info : devices_info_) {
@@ -99,7 +106,8 @@ public:
       const_cast<MemoryTracker *>(this)->record_sample();
     }
 
-    int64_t total_peak = 0;
+    // Allocator-tracked devices: sum of per-device peak_bytes_in_use above baseline.
+    int64_t physical_peak = 0;
     nb::gil_scoped_acquire gil;
     for (const auto &info : devices_info_) {
       if (!info.should_sample) {
@@ -108,16 +116,17 @@ public:
           int64_t current_peak = nb::cast<int64_t>(stats["peak_bytes_in_use"]);
           int64_t above_baseline = current_peak - info.allocator_baseline;
           if (above_baseline > 0) {
-            total_peak += above_baseline;
+            physical_peak += above_baseline;
           }
         } catch (...) {
         }
       }
     }
 
-    int64_t sampled_peak = peak_bytes_.load(std::memory_order_relaxed);
+    // Polled devices (CPU): max of logical_delta across samples.
+    int64_t logical_peak = peak_logical_bytes_.load(std::memory_order_relaxed);
 
-    return std::max(total_peak, sampled_peak);
+    return physical_peak + logical_peak;
   }
 
   int64_t baseline() const {
@@ -146,37 +155,33 @@ private:
     }
   }
 
-  int64_t read_live_arrays_for_device(const nb::object& device) {
-    nb::module_ jax = nb::module_::import_("jax");
-    nb::object arrays = jax.attr("live_arrays")();
-    int64_t total = 0;
-    for (auto arr_handle : arrays) {
-      nb::object arr = nb::borrow<nb::object>(arr_handle);
-      try {
-        nb::object devices = arr.attr("devices")();
-        if (nb::cast<bool>(devices.attr("__contains__")(device))) {
-          total += nb::cast<int64_t>(arr.attr("nbytes"));
-        }
-      } catch (...) {
-      }
-    }
-    return total;
-  }
-
+  // Sum nbytes of live arrays located on any tracked `should_sample` device.
+  // `jax.live_arrays(platform)` only enumerates arrays on a single backend, so
+  // we query each unique tracked platform (cached at construction).
   int64_t read_all_tracked_live_arrays() {
+    if (sampled_platforms_.empty()) return 0;
     nb::module_ jax = nb::module_::import_("jax");
-    nb::object arrays = jax.attr("live_arrays")();
     int64_t total = 0;
-    for (auto arr_handle : arrays) {
-      nb::object arr = nb::borrow<nb::object>(arr_handle);
+    for (const auto& platform : sampled_platforms_) {
+      nb::object arrays;
       try {
-        nb::object devices = arr.attr("devices")();
-        for (const auto& info : devices_info_) {
-          if (nb::cast<bool>(devices.attr("__contains__")(info.device))) {
-            total += nb::cast<int64_t>(arr.attr("nbytes"));
-          }
-        }
+        arrays = jax.attr("live_arrays")(platform);
       } catch (...) {
+        continue;
+      }
+      for (auto arr_handle : arrays) {
+        nb::object arr = nb::borrow<nb::object>(arr_handle);
+        try {
+          nb::object devices = arr.attr("devices")();
+          for (const auto& info : devices_info_) {
+            if (!info.should_sample) continue;
+            if (nb::cast<bool>(devices.attr("__contains__")(info.device))) {
+              total += nb::cast<int64_t>(arr.attr("nbytes"));
+              break;  // count each array once even if on several tracked devices
+            }
+          }
+        } catch (...) {
+        }
       }
     }
     return total;
@@ -184,43 +189,46 @@ private:
 
   void record_sample() {
     try {
-      int64_t logical_peak = read_all_tracked_live_arrays() - sampled_baseline_.load();
+      // CPU-style tracking via live_arrays (only `should_sample` devices).
+      int64_t logical_delta = read_all_tracked_live_arrays() - sampled_baseline_.load();
+      if (logical_delta < 0) logical_delta = 0;
 
-      int64_t physical_peak = 0;
+      // Allocator-tracked devices (GPU) — recorded for the sample snapshot only;
+      // the peak comes from `peak_bytes_in_use` in `peak()`.
+      int64_t physical_delta = 0;
       for (const auto& info : devices_info_) {
           if (!info.should_sample) {
               try {
                   nb::object stats = info.device.attr("memory_stats")();
-                  physical_peak += (nb::cast<int64_t>(stats["bytes_in_use"]) - info.allocator_baseline);
+                  int64_t d = nb::cast<int64_t>(stats["bytes_in_use"]) - info.allocator_baseline;
+                  if (d > 0) physical_delta += d;
               } catch (...) {}
           }
       }
 
-      int64_t above_baseline = std::max(logical_peak, physical_peak);
-      if (above_baseline < 0)
-        above_baseline = 0;
+      // Track max logical-only; GPU peak is the allocator's monotonic stat.
+      int64_t prev = peak_logical_bytes_.load(std::memory_order_relaxed);
+      while (logical_delta > prev &&
+             !peak_logical_bytes_.compare_exchange_weak(prev, logical_delta,
+                                                       std::memory_order_relaxed)) {
+      }
 
       auto now = std::chrono::steady_clock::now();
       int64_t ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
                        now - start_time_)
                        .count();
 
-      int64_t prev = peak_bytes_.load(std::memory_order_relaxed);
-      while (above_baseline > prev &&
-             !peak_bytes_.compare_exchange_weak(prev, above_baseline,
-                                                 std::memory_order_relaxed)) {
-      }
-
       std::lock_guard<std::mutex> lock(samples_mutex_);
-      samples_.push_back({above_baseline, ts});
+      samples_.push_back({logical_delta + physical_delta, ts});
     } catch (...) {
     }
   }
 
   std::vector<DeviceInfo> devices_info_;
+  std::vector<std::string> sampled_platforms_;
   int64_t poll_interval_ns_;
   std::atomic<bool> running_;
-  std::atomic<int64_t> peak_bytes_;
+  std::atomic<int64_t> peak_logical_bytes_;
   std::atomic<int64_t> sampled_baseline_;
   std::chrono::steady_clock::time_point start_time_;
 

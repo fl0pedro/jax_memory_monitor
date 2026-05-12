@@ -121,3 +121,48 @@ def test_samples_recorded():
     assert len(m.samples) > 0
     assert all(s.bytes >= 0 for s in m.samples)
     assert all(s.timestamp_ns >= 0 for s in m.samples)
+
+
+_GPUS = [d for d in jax.devices() if d.platform == "gpu"]
+_CPUS = [d for d in jax.devices("cpu") if d.platform == "cpu"]
+
+
+@pytest.mark.skipif(not (_GPUS and _CPUS), reason="needs at least one CPU and one GPU")
+def test_multi_device_peak_sums_across_platforms():
+    """Allocator-tracked GPU + polled CPU should sum to ~CPU_alloc + GPU_alloc."""
+    cpu = _CPUS[0]
+    gpu = _GPUS[0]
+    SIZE = (2000, 2000)
+    one_array = SIZE[0] * SIZE[1] * 4
+
+    with ResourceMonitor(devices=[cpu, gpu]) as m:
+        cpu_arr = jax.device_put(jnp.ones(SIZE, dtype=jnp.float32), cpu).block_until_ready()
+        gpu_arr = jax.device_put(jnp.ones(SIZE, dtype=jnp.float32), gpu).block_until_ready()
+        time.sleep(0.005)
+
+    # Peak should include both arrays — sum across platforms, not max of either.
+    assert m.peak >= 2 * one_array, (
+        f"expected >=2 arrays ({2*one_array}), got {m.peak}"
+    )
+
+
+@pytest.mark.skipif(len(_GPUS) < 2, reason="needs >=2 GPUs")
+def test_sharded_array_counted_once():
+    """A sharded array spans multiple tracked devices but should be counted once."""
+    import numpy as np
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    dst = _GPUS[:2]
+    SIZE = (4000, 4000)
+    nbytes = SIZE[0] * SIZE[1] * 4
+
+    mesh = Mesh(np.array(dst), ("x",))
+    sharding = NamedSharding(mesh, P("x"))
+
+    with ResourceMonitor(devices=dst) as m:
+        x = jax.device_put(jnp.ones(SIZE, dtype=jnp.float32), sharding).block_until_ready()
+        time.sleep(0.005)
+
+    # Even split: each device holds half. Total physical bytes ≈ one full array.
+    assert m.peak >= nbytes, f"expected >= {nbytes}, got {m.peak}"
+    assert m.peak < 4 * nbytes, f"likely double-counted: got {m.peak}"

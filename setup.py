@@ -13,7 +13,6 @@ ext_modules = [
         include_dirs=[
             nanobind.include_dir(),
             os.path.join(nanobind.include_dir(), "..", "ext", "robin_map", "include"),
-            "third_party/include",
         ],
         language='c++',
         extra_compile_args=['-std=c++17', '-O3', '-fPIC'],

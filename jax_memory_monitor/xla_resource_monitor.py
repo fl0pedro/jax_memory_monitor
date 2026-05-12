@@ -43,7 +43,7 @@ class ResourceMonitor:
         self._tracker: Optional[MemoryTracker] = None
         if self._do_peak:
             for dev in self.devices:
-                if dev.platform != "cpu" and not hasattr(dev, "clear_memory_stats"):
+                if not hasattr(dev, "clear_memory_stats"):
                     warnings.warn(
                         f"Device '{dev}' lacks 'clear_memory_stats'. "
                         "Peak memory will report a sampled high-water mark instead "

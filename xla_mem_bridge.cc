@@ -44,6 +44,29 @@ public:
       }
       devices_info_.push_back({std::move(device), should_sample, 0});
     }
+
+    // Cache the bound `jax.live_arrays` callable once, instead of importing jax
+    // on every poll tick. Also precompute, per sampled platform, whether we
+    // track *every* device on that backend: if so, every array `live_arrays`
+    // returns is on a tracked device and the per-array membership check (which
+    // builds a Python set via `arr.devices()`) can be skipped.
+    nb::module_ jax = nb::module_::import_("jax");
+    live_arrays_fn_ = jax.attr("live_arrays");
+    for (const auto &p : sampled_platforms_) {
+      int tracked = 0;
+      for (const auto &info : devices_info_) {
+        if (info.should_sample &&
+            nb::cast<std::string>(info.device.attr("platform")) == p) {
+          ++tracked;
+        }
+      }
+      int total = -1;
+      try {
+        total = static_cast<int>(nb::len(jax.attr("devices")(p)));
+      } catch (...) {
+      }
+      platform_track_all_.push_back(total > 0 && tracked == total);
+    }
   }
 
   ~MemoryTracker() { stop(); }
@@ -55,7 +78,9 @@ public:
 
     peak_logical_bytes_.store(0);
     samples_.clear();
-    start_time_ = std::chrono::steady_clock::now();
+    started_ = true;
+    stopped_ = false;
+    bool has_polled_device = false;
 
     {
       nb::gil_scoped_acquire gil;
@@ -66,12 +91,22 @@ public:
           } catch (...) {}
           nb::object stats = info.device.attr("memory_stats")();
           info.allocator_baseline = nb::cast<int64_t>(stats["bytes_in_use"]);
+        } else {
+          has_polled_device = true;
         }
       }
+      // Capture the live-array baseline last and start the clock immediately
+      // after, so the measured interval opens at a quiescent point and no
+      // allocation can fall into the baseline once timing has begun.
       sampled_baseline_.store(read_all_tracked_live_arrays());
+      start_time_ = std::chrono::steady_clock::now();
     }
 
-    if (!devices_info_.empty()) {
+    // Only spawn the polling thread when at least one device is sample-tracked.
+    // Allocator-backed devices (GPU/TPU) derive their peak from the monotonic
+    // `peak_bytes_in_use` stat read in peak(), so polling them would add ~1kHz
+    // of GIL contention to the measured region for zero accuracy gain.
+    if (has_polled_device) {
       samples_.reserve(1024);
       running_.store(true);
       worker_ = std::thread(&MemoryTracker::poll_loop, this);
@@ -79,7 +114,13 @@ public:
   }
 
   void stop() {
+    // Idempotent: an explicit stop() followed by ~MemoryTracker (or any double
+    // stop) must not overwrite stop_time_ or take a second snapshot, and a
+    // never-started tracker must not touch Python state during destruction.
+    if (!started_ || stopped_) return;
+    stopped_ = true;
     stop_time_ = std::chrono::steady_clock::now();
+
     if (running_.load()) {
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -92,23 +133,25 @@ public:
         if (worker_.joinable())
           worker_.join();
       }
-
-      {
-        nb::gil_scoped_acquire gil;
-        record_sample();
-      }
     }
+
+    // Final synchronous snapshot after the caller's exit barrier. Works for
+    // both polled and allocator-only trackers and keeps .samples non-empty
+    // even when no polling thread ran.
+    nb::gil_scoped_acquire gil;
+    record_sample();
   }
 
   int64_t peak() const {
+    // Single GIL acquisition for the whole read: the optional fresh sample and
+    // the per-device memory_stats() queries below both need it.
+    nb::gil_scoped_acquire gil;
     if (running_.load()) {
-      nb::gil_scoped_acquire gil;
       const_cast<MemoryTracker *>(this)->record_sample();
     }
 
     // Allocator-tracked devices: sum of per-device peak_bytes_in_use above baseline.
     int64_t physical_peak = 0;
-    nb::gil_scoped_acquire gil;
     for (const auto &info : devices_info_) {
       if (!info.should_sample) {
         try {
@@ -157,21 +200,27 @@ private:
 
   // Sum nbytes of live arrays located on any tracked `should_sample` device.
   // `jax.live_arrays(platform)` only enumerates arrays on a single backend, so
-  // we query each unique tracked platform (cached at construction).
+  // we query each unique tracked platform via the callable cached at
+  // construction. When we track every device on a platform (`track_all`), the
+  // per-array `arr.devices()` membership check is skipped entirely.
   int64_t read_all_tracked_live_arrays() {
     if (sampled_platforms_.empty()) return 0;
-    nb::module_ jax = nb::module_::import_("jax");
     int64_t total = 0;
-    for (const auto& platform : sampled_platforms_) {
+    for (size_t i = 0; i < sampled_platforms_.size(); ++i) {
       nb::object arrays;
       try {
-        arrays = jax.attr("live_arrays")(platform);
+        arrays = live_arrays_fn_(sampled_platforms_[i]);
       } catch (...) {
         continue;
       }
+      const bool track_all = platform_track_all_[i];
       for (auto arr_handle : arrays) {
         nb::object arr = nb::borrow<nb::object>(arr_handle);
         try {
+          if (track_all) {
+            total += nb::cast<int64_t>(arr.attr("nbytes"));
+            continue;
+          }
           nb::object devices = arr.attr("devices")();
           for (const auto& info : devices_info_) {
             if (!info.should_sample) continue;
@@ -226,8 +275,12 @@ private:
 
   std::vector<DeviceInfo> devices_info_;
   std::vector<std::string> sampled_platforms_;
+  nb::object live_arrays_fn_;
+  std::vector<bool> platform_track_all_;
   int64_t poll_interval_ns_;
   std::atomic<bool> running_;
+  bool started_ = false;
+  bool stopped_ = false;
   std::atomic<int64_t> peak_logical_bytes_;
   std::atomic<int64_t> sampled_baseline_;
   std::chrono::steady_clock::time_point start_time_;

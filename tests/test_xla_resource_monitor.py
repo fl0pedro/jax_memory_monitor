@@ -123,6 +123,39 @@ def test_samples_recorded():
     assert all(s.timestamp_ns >= 0 for s in m.samples)
 
 
+def test_exception_in_block_still_finalizes():
+    """An exception in the with-block must still stop the trackers.
+
+    __exit__ runs jax.effects_barrier() first (to flush async work before the
+    clock/peak are read); the stop() calls live in a finally so a raising
+    barrier — or a raising body — can never leak the native poll thread.
+    """
+    m = ResourceMonitor()
+    with pytest.raises(RuntimeError, match="boom"):
+        with m:
+            jnp.ones((1000, 1000)).block_until_ready()
+            raise RuntimeError("boom")
+    # Trackers were finalized despite the exception → stats are readable & sane.
+    assert m.duration >= 0
+    assert m.peak >= 0
+
+
+def test_double_stop_preserves_duration():
+    """stop() is idempotent: a second call (e.g. via __del__) must not move the
+    clock or take another snapshot."""
+    from xla_mem_bridge import MemoryTracker
+
+    tracker = MemoryTracker(jax.local_devices())
+    tracker.start()
+    jnp.ones((1000, 1000)).block_until_ready()
+    tracker.stop()
+    first = tracker.duration
+    time.sleep(0.02)
+    tracker.stop()  # second stop must be a no-op
+    assert tracker.duration == first
+    assert tracker.peak >= 0
+
+
 _GPUS = [d for d in jax.devices() if d.platform == "gpu"]
 _CPUS = [d for d in jax.devices("cpu") if d.platform == "cpu"]
 

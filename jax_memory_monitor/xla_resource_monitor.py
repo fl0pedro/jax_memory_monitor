@@ -66,11 +66,13 @@ class ResourceMonitor:
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if self._time_tracker is not None:
-            self._time_tracker.stop()
-        if self._tracker is not None:
-            self._tracker.stop()
-        jax.effects_barrier()
+        try:
+            jax.effects_barrier()
+        finally:
+            if self._time_tracker is not None:
+                self._time_tracker.stop()
+            if self._tracker is not None:
+                self._tracker.stop()
 
     @property
     def peak(self) -> int:

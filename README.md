@@ -18,10 +18,6 @@ polls without holding the GIL longer than necessary:
 summed across all monitored devices. Either tracker can be disabled with
 `time=False` or `peak=False`.
 
-The legacy `PeakMemoryMonitor`, which polls
-`jax.profiler.device_memory_profile()` (pprof) from a Python thread, is kept
-around for compatibility and emits a `DeprecationWarning`.
-
 ## Installation
 
 ```bash

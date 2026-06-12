@@ -17,10 +17,7 @@ jobs:
       - name: Set up Python
         run: uv python install
       - name: Run tests
-        run: |
-          cd jax_memory_monitor
-          uv pip install pytest
-          uv run pytest tests/test_main.py
+        run: uv run --with pytest pytest tests/
 
   release:
     needs: test
@@ -39,20 +36,16 @@ jobs:
       - name: Set up Python
         run: uv python install
       - name: Build package
-        run: |
-          cd jax_memory_monitor
-          uv build
+        run: uv build
       - name: Publish to PyPI
         if: startsWith(github.ref, 'refs/tags/jax_memory_monitor-v')
-        run: |
-          cd jax_memory_monitor
-          uv publish
+        run: uv publish
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
       - name: Create GitHub Release
         uses: softprops/action-release@v2
         if: startsWith(github.ref, 'refs/tags/jax_memory_monitor-v')
         with:
-          files: jax_memory_monitor/dist/*
+          files: dist/*
           generate_release_notes: true
           tag_name: ${{ github.ref_name }}
